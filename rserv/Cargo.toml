@@ -1,0 +1,8 @@
+[package]
+name = "rserv"
+version = "0.1.0"
+authors = ["Greg Fodor <gfodor@gmail.com>"]
+
+[dependencies]
+zmq = "0.8"
+rand = "0.3"
