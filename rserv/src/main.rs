@@ -19,31 +19,32 @@ fn main() {
     };
 }
 
-fn incoming_thread() -> GenResult<bool> {
-    let context = zmq::Context::new();
-    let req = context.socket(zmq::DEALER)?;
-    let identity = "LocalDealer";
-    req.set_identity(identity.as_bytes())?;
+fn incoming_thread(context: &zmq::Context) -> GenResult<bool> {
+    let dealer= context.socket(zmq::DEALER)?;
+    dealer.set_identity("LocalDealer".as_bytes())?;
 
-    req.connect("tcp://localhost:5555")?;
+    dealer.connect("inproc://dealer").expect("local connect fail");
 
     let mut i = 1;
 
     loop {
-        println!("sending {}", i);
-        req.send("".as_bytes(), zmq::SNDMORE)?;
-        req.send(format!("{}", i).as_bytes(), 0)?;
+        if i % 1000 == 0 {
+            println!("sending {}", i);
+        }
+
+        dealer.send("".as_bytes(), zmq::SNDMORE)?;
+        dealer.send(format!("{}", i).as_bytes(), 0)?;
 
         loop {
             let mut items = [
-                req.as_poll_item(zmq::POLLIN)
+                dealer.as_poll_item(zmq::POLLIN)
             ];
 
             // Deplete replies
             zmq::poll(&mut items, 0)?;
 
             if items[0].is_readable() {
-                let response = req.recv_string(0)?.unwrap();
+                let response = dealer.recv_string(0)?.unwrap();
             } else {
                 break;
             }
@@ -69,8 +70,8 @@ fn run_janus() -> GenResult<bool> {
     let mut should_resend_last_message = false;
     let mut last_message : Option<String> = None;
 
-    local_router.bind("tcp://*:5555").expect("Binding fail");
-    thread::spawn(move || { incoming_thread(); });
+    local_router.bind("inproc://dealer").expect("Binding fail");
+    thread::spawn(move || { incoming_thread(&context.clone()); });
 
     remote_router.bind("tcp://*:5557").expect("Binding fail");
 
@@ -100,29 +101,27 @@ fn run_janus() -> GenResult<bool> {
             local_router.send(reply.as_bytes(), 0)?;
         }
 
-        if items[1].is_readable() {
-            if can_send_next_message_to_remote {
-                let local_client_id = local_router.recv_string(0)?;
-                local_router.recv_string(0)?; // Empty frame
-                let next_message = local_router.recv_string(0)?; // Data payload
-                let include_last_message = should_resend_last_message && last_message.is_some();
+        if items[1].is_readable() && can_send_next_message_to_remote {
+            let local_client_id = local_router.recv_string(0)?;
+            local_router.recv_string(0)?; // Empty frame
+            let next_message = local_router.recv_string(0)?; // Data payload
+            let include_last_message = should_resend_last_message && last_message.is_some();
 
-                remote_router.send(remote_client_id.as_ref().expect("no client").as_bytes(), zmq::SNDMORE)?;
-                remote_router.send("".as_bytes(), zmq::SNDMORE)?;
-                remote_router.send(local_client_id.as_ref().expect("err").as_bytes(), zmq::SNDMORE)?;
-                remote_router.send("".as_bytes(), zmq::SNDMORE)?;
+            remote_router.send(remote_client_id.as_ref().expect("no client").as_bytes(), zmq::SNDMORE)?;
+            remote_router.send("".as_bytes(), zmq::SNDMORE)?;
+            remote_router.send(local_client_id.as_ref().expect("err").as_bytes(), zmq::SNDMORE)?;
+            remote_router.send("".as_bytes(), zmq::SNDMORE)?;
 
-                if include_last_message {
-                    remote_router.send(last_message.as_ref().expect("err").as_bytes(), zmq::SNDMORE)?;
-                    should_resend_last_message = false;
-                }
-
-                remote_router.send(next_message.as_ref().expect("err").as_bytes(), 0)?;
-
-                last_message = Some(next_message.as_ref().unwrap().clone());
-
-                can_send_next_message_to_remote = false;
+            if include_last_message {
+                remote_router.send(last_message.as_ref().expect("err").as_bytes(), zmq::SNDMORE)?;
+                should_resend_last_message = false;
             }
+
+            remote_router.send(next_message.as_ref().expect("err").as_bytes(), 0)?;
+
+            last_message = Some(next_message.as_ref().unwrap().clone());
+
+            can_send_next_message_to_remote = false;
         }
     }
 
@@ -143,7 +142,12 @@ fn run_ret() -> GenResult<bool> {
         socket.recv_msg(0).expect("error receiving"); // ident
         socket.recv_msg(0).expect("error receiving empty");
         let message = socket.recv_msg(0).expect("error receiving");
-        println!("Got {}", message.as_str().unwrap());
+        let str = message.as_str().unwrap();
+        let i: i32 = str.parse().unwrap();
+
+        if (i % 1000 == 0) {
+            println!("Got {}", str);
+        }
 
         if socket.get_rcvmore().unwrap() {
             let extra_message = socket.recv_msg(0).expect("error receiving");
