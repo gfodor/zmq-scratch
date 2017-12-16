@@ -21,10 +21,14 @@ fn main() {
 
 fn incoming_thread(context: &zmq::Context) -> GenResult<bool> {
     let dealer= context.socket(zmq::DEALER)?;
+
     dealer.set_identity("LocalDealer".as_bytes())?;
+    dealer.set_sndhwm(1000000); // Allow large outgoing queue
 
     dealer.connect("inproc://dealer").expect("local connect fail");
 
+    let mut items = [ dealer.as_poll_item(zmq::POLLIN) ];
+    let empty_bytes = "".as_bytes();
     let mut i = 1;
 
     loop {
@@ -32,25 +36,19 @@ fn incoming_thread(context: &zmq::Context) -> GenResult<bool> {
             println!("sending {}", i);
         }
 
-        dealer.send("".as_bytes(), zmq::SNDMORE)?;
+        dealer.send(empty_bytes, zmq::SNDMORE)?;
         dealer.send(format!("{}", i).as_bytes(), 0)?;
 
         loop {
-            let mut items = [
-                dealer.as_poll_item(zmq::POLLIN)
-            ];
-
             // Deplete replies
             zmq::poll(&mut items, 0)?;
 
             if items[0].is_readable() {
-                let response = dealer.recv_string(0)?.unwrap();
+                dealer.recv_msg(0)?;
             } else {
                 break;
             }
         }
-
-        //thread::sleep(Duration::from_millis(1000));
 
         i = i + 1;
     }
@@ -65,61 +63,75 @@ fn run_janus() -> GenResult<bool> {
     let local_router = context.socket(zmq::ROUTER)?;
     let remote_router = context.socket(zmq::ROUTER)?;
 
-    let mut remote_client_id : Option<String> = None;
     let mut can_send_next_message_to_remote = false;
     let mut should_resend_last_message = false;
-    let mut last_message : Option<String> = None;
+
+    let mut remote_client_id : Option<zmq::Message> = None;
+    let mut last_message : Option<zmq::Message> = None;
+
+    let empty_bytes = "".as_bytes();
+    let local_dealer_bytes = "LocalDealer".as_bytes();
 
     local_router.bind("inproc://dealer").expect("Binding fail");
     thread::spawn(move || { incoming_thread(&context.clone()); });
 
-    remote_router.bind("tcp://*:5557").expect("Binding fail");
+    remote_router.bind("ipc:///tmp/janus-ret.sock").expect("Binding fail");
+
+    let mut pollers = [
+        remote_router.as_poll_item(zmq::POLLIN),
+        local_router.as_poll_item(zmq::POLLIN)
+    ];
+
+    let mut i = 1;
 
     loop {
-        let mut items = [
-            remote_router.as_poll_item(zmq::POLLIN),
-            local_router.as_poll_item(zmq::POLLIN)
-        ];
+        zmq::poll(&mut pollers[0..if remote_client_id.is_none() { 1 } else { 2 }], 0)?;
 
-        zmq::poll(&mut items[0..if remote_client_id.is_none() { 1 } else { 2 }], 0)?;
-
-        if items[0].is_readable() {
-            let remote_client_value = remote_router.recv_string(0).expect("Failed to read remote").unwrap();
-            remote_router.recv_string(0).expect("Failed to read frame").unwrap();
+        if pollers[0].is_readable() {
+            let remote_client_value = remote_router.recv_msg(0)?;
+            remote_router.recv_msg(0)?;
 
             // Remote is still connected
-            // Read reply and forward to local req
+            // Read reply and forward to local dealer
             can_send_next_message_to_remote = true;
 
-            should_resend_last_message = remote_client_id.is_some() && !remote_client_value.eq(remote_client_id.as_ref().unwrap());
+            // If the remote client id changed, we need to resend the last message
+            should_resend_last_message = remote_client_id.is_some() && !remote_client_value.eq(&remote_client_id.as_ref().unwrap());
 
-            remote_client_id = Some(remote_client_value);
+            if remote_client_id.is_none() || should_resend_last_message {
+                remote_client_id = Some(zmq::Message::from_slice(&remote_client_value)?);
+            }
 
-            let reply = remote_router.recv_string(0).unwrap().unwrap();
-            local_router.send("LocalDealer".as_bytes(), zmq::SNDMORE)?;
-            local_router.send("".as_bytes(), zmq::SNDMORE)?;
-            local_router.send(reply.as_bytes(), 0)?;
+            let reply = remote_router.recv_msg(0)?;
+            local_router.send(local_dealer_bytes, zmq::SNDMORE)?;
+            local_router.send(empty_bytes, zmq::SNDMORE)?;
+            local_router.send_msg(reply, 0)?;
         }
 
-        if items[1].is_readable() && can_send_next_message_to_remote {
-            let local_client_id = local_router.recv_string(0)?;
-            local_router.recv_string(0)?; // Empty frame
-            let next_message = local_router.recv_string(0)?; // Data payload
+        if pollers[1].is_readable() && can_send_next_message_to_remote {
+            i = i + 1;
+
+            if i % 1000 == 0 {
+                println!("route {}" , i);
+            }
+
+            let local_client_id = &local_router.recv_msg(0)?;
+            local_router.recv_msg(0)?; // Empty frame
+            let next_message = local_router.recv_msg(0)?; // Data payload
             let include_last_message = should_resend_last_message && last_message.is_some();
 
-            remote_router.send(remote_client_id.as_ref().expect("no client").as_bytes(), zmq::SNDMORE)?;
-            remote_router.send("".as_bytes(), zmq::SNDMORE)?;
-            remote_router.send(local_client_id.as_ref().expect("err").as_bytes(), zmq::SNDMORE)?;
-            remote_router.send("".as_bytes(), zmq::SNDMORE)?;
+            remote_router.send(remote_client_id.as_ref().unwrap(), zmq::SNDMORE)?;
+            remote_router.send(empty_bytes, zmq::SNDMORE)?;
+            remote_router.send(&local_client_id, zmq::SNDMORE)?;
+            remote_router.send(empty_bytes, zmq::SNDMORE)?;
 
             if include_last_message {
-                remote_router.send(last_message.as_ref().expect("err").as_bytes(), zmq::SNDMORE)?;
+                remote_router.send_msg(last_message.unwrap(), zmq::SNDMORE)?;
                 should_resend_last_message = false;
             }
 
-            remote_router.send(next_message.as_ref().expect("err").as_bytes(), 0)?;
-
-            last_message = Some(next_message.as_ref().unwrap().clone());
+            last_message = Some(zmq::Message::from_slice(&next_message)?);
+            remote_router.send_msg(next_message, 0)?;
 
             can_send_next_message_to_remote = false;
         }
@@ -135,19 +147,21 @@ fn run_ret() -> GenResult<bool> {
     let socket = ctx.socket(zmq::REQ)?;
 
     socket.set_identity(format!("Ret {}", rand::thread_rng().gen_ascii_chars().take(5).collect::<String>()).as_bytes())?;
-    socket.connect("tcp://127.0.0.1:5557")?;
+    socket.connect("ipc:///tmp/janus-ret.sock")?;
+    let mut i = 0;
+    let empty_bytes = "".as_bytes();
 
     loop {
-        socket.send("next".as_bytes(), 0).expect("error sending");
+        socket.send(empty_bytes, 0).expect("error sending");
         socket.recv_msg(0).expect("error receiving"); // ident
         socket.recv_msg(0).expect("error receiving empty");
         let message = socket.recv_msg(0).expect("error receiving");
-        let str = message.as_str().unwrap();
-        let i: i32 = str.parse().unwrap();
 
-        if (i % 1000 == 0) {
-            println!("Got {}", str);
+        if i % 1000 == 0 {
+            println!("Received msg {}", i);
         }
+
+        i = i + 1;
 
         if socket.get_rcvmore().unwrap() {
             let extra_message = socket.recv_msg(0).expect("error receiving");
