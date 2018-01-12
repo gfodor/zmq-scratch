@@ -132,6 +132,9 @@ fn run_janus() -> GenResult<bool> {
             // which is the length of the first payload in bytes.
             //
             // If more data exists after that length in the message, that is the second payload.
+            // This has to be done because the chumak elixir zmq client does not support multipart
+            // message receiving, so we need to layer on this additional protocol to identify the
+            // payload boundary.
 
             if include_last_message {
                 let last_message_msg = last_message.unwrap();
