@@ -5,6 +5,8 @@ use std::env;
 use std::thread;
 use std::time::Duration;
 use rand::{Rng};
+use std::slice;
+use std::mem;
 
 type GenError = Box<std::error::Error>;
 type GenResult<T> = Result<T, GenError>;
@@ -32,9 +34,11 @@ fn incoming_thread(context: &zmq::Context) -> GenResult<bool> {
     let mut i = 1;
 
     loop {
-        if i % 1000 == 0 {
+        thread::sleep(Duration::from_millis(1000));
+
+        //if i % 1000 == 0 {
             println!("sending {}", i);
-        }
+        //}
 
         dealer.send(empty_bytes, zmq::SNDMORE)?;
         dealer.send(format!("{}", i).as_bytes(), 0)?;
@@ -75,7 +79,7 @@ fn run_janus() -> GenResult<bool> {
     local_router.bind("inproc://dealer").expect("Binding fail");
     thread::spawn(move || { incoming_thread(&context.clone()); });
 
-    remote_router.bind("ipc:///tmp/janus-ret.sock").expect("Binding fail");
+    remote_router.bind("tcp://*:5555").expect("Binding fail");
 
     let mut pollers = [
         remote_router.as_poll_item(zmq::POLLIN),
@@ -122,15 +126,32 @@ fn run_janus() -> GenResult<bool> {
 
             remote_router.send(remote_client_id.as_ref().unwrap(), zmq::SNDMORE)?;
             remote_router.send(empty_bytes, zmq::SNDMORE)?;
-            remote_router.send(&local_client_id, zmq::SNDMORE)?;
-            remote_router.send(empty_bytes, zmq::SNDMORE)?;
+
+            // Message may have two payloads if we are re-playing the last message.
+            // The separation between payloads is determined by the initial 64-bit length value
+            // which is the length of the first payload in bytes.
+            //
+            // If more data exists after that length in the message, that is the second payload.
 
             if include_last_message {
-                remote_router.send_msg(last_message.unwrap(), zmq::SNDMORE)?;
+                let last_message_msg = last_message.unwrap();
+                let len : i64 = last_message_msg.len() as i64;
+                let lens: &[u8] = unsafe { slice::from_raw_parts((&len as *const i64) as *const _, mem::size_of::<usize>()) };
+
+                remote_router.send(lens, zmq::SNDMORE)?;
+                remote_router.send_msg(last_message_msg, zmq::SNDMORE)?;
                 should_resend_last_message = false;
+
+                last_message = Some(zmq::Message::from_slice(&next_message)?);
+            } else {
+                let len : i64 = next_message.len() as i64;
+                let lenp: *const i64 = &len;
+                let lens: &[u8] = unsafe { slice::from_raw_parts((&len as *const i64) as *const _, mem::size_of::<usize>()) };
+
+                remote_router.send(lens, zmq::SNDMORE)?;
+                last_message = Some(zmq::Message::from_slice(&next_message)?);
             }
 
-            last_message = Some(zmq::Message::from_slice(&next_message)?);
             remote_router.send_msg(next_message, 0)?;
 
             can_send_next_message_to_remote = false;
@@ -147,19 +168,17 @@ fn run_ret() -> GenResult<bool> {
     let socket = ctx.socket(zmq::REQ)?;
 
     socket.set_identity(format!("Ret {}", rand::thread_rng().gen_ascii_chars().take(5).collect::<String>()).as_bytes())?;
-    socket.connect("ipc:///tmp/janus-ret.sock")?;
+    socket.connect("tcp://127.0.0.1:5555")?;
     let mut i = 0;
     let empty_bytes = "".as_bytes();
 
     loop {
         socket.send(empty_bytes, 0).expect("error sending");
-        socket.recv_msg(0).expect("error receiving"); // ident
-        socket.recv_msg(0).expect("error receiving empty");
         let message = socket.recv_msg(0).expect("error receiving");
 
-        if i % 1000 == 0 {
-            println!("Received msg {}", i);
-        }
+        //if i % 1000 == 0 {
+            println!("Received msg {}", message.as_str().unwrap());
+        //}
 
         i = i + 1;
 
